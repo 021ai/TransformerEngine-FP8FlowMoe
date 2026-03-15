@@ -53,6 +53,7 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
         *args,
         **kwargs,
     ):
+        is_scaling_aware_transpose = kwargs.pop("is_scaling_aware_transpose", True)
         if cls is Float8BlockwiseQTensorBase:
             instance = object.__new__(cls)
         else:
@@ -65,6 +66,7 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
         instance._columnwise_scale_inv = columnwise_scale_inv
         instance._is_2D_scaled = is_2D_scaled
         instance._data_format = data_format
+        instance._is_scaling_aware_transpose = is_scaling_aware_transpose
 
         return instance
 
@@ -90,6 +92,7 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
             "quantizer": self._quantizer,
             "is_2D_scaled": self._is_2D_scaled,
             "data_format": self._data_format,
+            "is_scaling_aware_transpose": self._is_scaling_aware_transpose,
         }
 
     def _is_gemm_ready_format(self) -> bool:
@@ -155,6 +158,9 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
             for i in range(len(q.shape) - 1):
                 q_M *= q.shape[i]
             inner_q_dimension_tiled = True
+            # Temporary solution
+            if self._is_gemm_ready_format() and q_M == scale_inv.shape[0]:
+                self._data_format = tex.Float8BlockScaleTensorFormat.COMPACT
             if self._is_gemm_ready_format():
                 scales_tiled_dim, scales_untiled_dim = scale_inv.shape
                 inner_scale_dimension_tiled = False

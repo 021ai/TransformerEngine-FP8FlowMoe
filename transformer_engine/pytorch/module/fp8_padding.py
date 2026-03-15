@@ -12,6 +12,7 @@ import transformer_engine_torch as tex
 
 from ..fp8 import FP8GlobalStateManager
 from ..jit import no_torch_dynamo
+from ..tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
 
 
 __all__ = ["Fp8Padding"]
@@ -32,16 +33,50 @@ class _Fp8Padding(torch.autograd.Function):
         # Make sure input dimensions are compatible
         in_features = inp.shape[-1]
 
+        fp8_blockwise_recipe = isinstance(inp, Float8BlockwiseQTensor)
+        requires_dgrad = inp.requires_grad
+        if fp8_blockwise_recipe:
+            dtype = inp.dtype
+            fp8_dtype = inp._fp8_dtype
+            data_format = inp._data_format
+            is_scaling_aware_transpose = inp._is_scaling_aware_transpose
+            scale = inp._rowwise_scale_inv
+            inp = inp._rowwise_data
+
         # Allocate cast and transpose output tensor
         total_row = sum(padded_m_splits)
         out = torch.empty([total_row, in_features], dtype=inp.dtype, device=inp.device)
 
         tex.fused_multi_row_padding(inp.view(-1, in_features), out, m_splits, padded_m_splits)
 
+        if fp8_blockwise_recipe:
+            # Do FP8 scaling_inv padding
+            scale_out = torch.empty(
+                [total_row, scale.shape[-1]],
+                dtype=scale.dtype,
+                device=inp.device,
+            )
+            tex.fused_multi_row_padding(
+                scale, scale_out, m_splits, padded_m_splits,
+            )
+            out = Float8BlockwiseQTensor(
+                shape=out.shape,
+                dtype=dtype,
+                rowwise_data=out,
+                rowwise_scale_inv=scale_out,
+                columnwise_data=None,
+                columnwise_scale_inv=None,
+                fp8_dtype=fp8_dtype,
+                quantizer=None,
+                is_2D_scaled=False,
+                requires_grad=out.requires_grad,
+                data_format=data_format,
+                is_scaling_aware_transpose=is_scaling_aware_transpose,
+            )
         if is_grad_enabled:
             ctx.m_splits = m_splits
             ctx.padded_m_splits = padded_m_splits
-            ctx.requires_dgrad = inp.requires_grad
+            ctx.requires_dgrad = requires_dgrad
 
         return out
 
@@ -53,16 +88,15 @@ class _Fp8Padding(torch.autograd.Function):
         if ctx.requires_dgrad:
             grad_output = grad_output.contiguous()
 
-            in_features = grad_output.shape[-1]
-
-            # Allocate cast and transpose output tensor
-            total_row = sum(ctx.m_splits)
-            grad_input = torch.empty(
-                [total_row, in_features], dtype=grad_output.dtype, device=grad_output.device
+            grad_output_mats = torch.split(
+                grad_output.view(-1, grad_output.shape[-1]), ctx.padded_m_splits,
             )
-
-            tex.fused_multi_row_unpadding(
-                grad_output.view(-1, in_features), grad_input, ctx.padded_m_splits, ctx.m_splits
+            grad_input = torch.cat(
+                [
+                    grad_output_mat[: ctx.m_splits[i]]
+                    for i, grad_output_mat in enumerate(grad_output_mats)
+                ],
+                dim=0,
             )
 
         return (grad_input, None, None, None)

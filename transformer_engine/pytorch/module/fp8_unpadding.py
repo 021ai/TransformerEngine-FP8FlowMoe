@@ -12,6 +12,7 @@ import transformer_engine_torch as tex
 
 from ..fp8 import FP8GlobalStateManager
 from ..jit import no_torch_dynamo
+from ..tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
 
 
 __all__ = ["Fp8Unpadding"]
@@ -29,13 +30,12 @@ class _Fp8Unpadding(torch.autograd.Function):
         is_grad_enabled: bool,
     ) -> torch.Tensor:
         # pylint: disable=missing-function-docstring
-        in_features = inp.shape[-1]
 
-        # Allocate cast and transpose output tensor
-        total_row = sum(m_splits)
-        out_ret = torch.empty([total_row, in_features], dtype=inp.dtype, device=inp.device)
-
-        tex.fused_multi_row_unpadding(inp.view(-1, in_features), out_ret, padded_m_splits, m_splits)
+        inputmats = torch.split(inp.view(-1, inp.shape[-1]), padded_m_splits)
+        out_ret = torch.cat(
+            [mat[: m_splits[i]] for i, mat in enumerate(inputmats)],
+            dim=0,
+        )
 
         if is_grad_enabled:
             ctx.m_splits = m_splits
@@ -53,6 +53,15 @@ class _Fp8Unpadding(torch.autograd.Function):
 
             in_features = grad_output.shape[-1]
 
+            fp8_blockwise_recipe = isinstance(grad_output, Float8BlockwiseQTensor)
+            if fp8_blockwise_recipe:
+                dtype = grad_output.dtype
+                fp8_dtype = grad_output._fp8_dtype
+                data_format = grad_output._data_format
+                is_scaling_aware_transpose = grad_output._is_scaling_aware_transpose
+                scale = grad_output._rowwise_scale_inv
+                grad_output = grad_output._rowwise_data
+
             # Allocate cast and transpose output tensor
             total_row = sum(ctx.padded_m_splits)
             grad_input = torch.empty(
@@ -62,6 +71,28 @@ class _Fp8Unpadding(torch.autograd.Function):
             tex.fused_multi_row_padding(
                 grad_output.view(-1, in_features), grad_input, ctx.m_splits, ctx.padded_m_splits
             )
+
+            if fp8_blockwise_recipe:
+                scale_out = torch.empty(
+                    [total_row, scale.shape[-1]], dtype=scale.dtype, device=scale.device,
+                )
+                tex.fused_multi_row_padding(
+                    scale, scale_out, ctx.m_splits, ctx.padded_m_splits,
+                )
+                grad_input = Float8BlockwiseQTensor(
+                    shape=grad_input.shape,
+                    dtype=dtype,
+                    rowwise_data=grad_input,
+                    rowwise_scale_inv=scale_out,
+                    columnwise_data=None,
+                    columnwise_scale_inv=None,
+                    fp8_dtype=fp8_dtype,
+                    quantizer=None,
+                    is_2D_scaled=False,
+                    requires_grad=grad_input.requires_grad,
+                    data_format=data_format,
+                    is_scaling_aware_transpose=is_scaling_aware_transpose,
+                )
 
         return (grad_input, None, None, None)
 

@@ -49,6 +49,7 @@ from ..tensor.quantized_tensor import (
     prepare_for_saving,
     restore_from_saved,
 )
+from ..tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
 
 __all__ = ["GroupedLinear"]
 
@@ -124,7 +125,16 @@ class _GroupedLinear(torch.autograd.Function):
         inp_view = inp.reshape(-1, in_features)
         inputmats: list
         if fp8:
-            inputmats = tex.split_quantize(inp_view, m_splits, input_quantizers)
+            if isinstance(inp_view, Float8BlockwiseQTensor):
+                if inp_view._is_scaling_aware_transpose:
+                    inputmats = inp_view.split_scaling_aware_fp8_transpose(
+                        m_splits, input_quantizers
+                    )
+                else:
+                    inp_view = inp_view.dequantize()
+                    inputmats = tex.split_quantize(inp_view, m_splits, input_quantizers)
+            else:
+                inputmats = tex.split_quantize(inp_view, m_splits, input_quantizers)
         else:
             inputmats = torch.split(cast_if_needed(inp_view, activation_dtype), m_splits)
 
@@ -296,18 +306,44 @@ class _GroupedLinear(torch.autograd.Function):
                         # Unfused bias grad and multi-tensor quantize
                         for i in range(ctx.num_gemms):
                             grad_biases[i] = grad_output_mats[i].sum(dim=0)
+                        if isinstance(grad_output_view, Float8BlockwiseQTensor):
+                            if grad_output_view._is_scaling_aware_transpose:
+                                grad_output = grad_output_view.split_scaling_aware_fp8_transpose(
+                                    ctx.m_splits, ctx.grad_output_quantizers
+                                )
+                            else:
+                                grad_output_view = grad_output_view.dequantize()
+                                grad_output = tex.split_quantize(
+                                    grad_output_view,
+                                    ctx.m_splits,
+                                    ctx.grad_output_quantizers,
+                                )
+                        else:
+                            grad_output = tex.split_quantize(
+                                grad_output_view,
+                                ctx.m_splits,
+                                ctx.grad_output_quantizers,
+                            )
+                else:
+                    # Multi-tensor quantize
+                    if isinstance(grad_output_view, Float8BlockwiseQTensor):
+                        if grad_output_view._is_scaling_aware_transpose:
+                            grad_output = grad_output_view.split_scaling_aware_fp8_transpose(
+                                ctx.m_splits, ctx.grad_output_quantizers
+                            )
+                        else:
+                            grad_output_view = grad_output_view.dequantize()
+                            grad_output = tex.split_quantize(
+                                grad_output_view,
+                                ctx.m_splits,
+                                ctx.grad_output_quantizers,
+                            )
+                    else:
                         grad_output = tex.split_quantize(
                             grad_output_view,
                             ctx.m_splits,
                             ctx.grad_output_quantizers,
                         )
-                else:
-                    # Multi-tensor quantize
-                    grad_output = tex.split_quantize(
-                        grad_output_view,
-                        ctx.m_splits,
-                        ctx.grad_output_quantizers,
-                    )
             else:
                 # Only split grad output. Grad bias is fused with
                 # wgrad GEMM.
@@ -733,9 +769,9 @@ class GroupedLinear(TransformerEngineBaseModule):
                                first microbatch (since it is the first gradient being
                                produced)
         """
-        assert not isinstance(
-            inp, QuantizedTensorBase
-        ), "GroupedLinear doesn't support input tensor in FP8."
+        # assert not isinstance(
+        #     inp, QuantizedTensorBase
+        # ), "GroupedLinear doesn't support input tensor in FP8."
         assert len(m_splits) == self.num_gemms, "Number of splits should match number of GEMMs."
 
         if FP8GlobalStateManager.fp8_graph_capturing():
